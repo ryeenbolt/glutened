@@ -26,6 +26,12 @@
   let searchQuery = "";
   let detailTarget = null; // {kind, id}
 
+  let currentLoc = { lat: MAUMELLE.lat, lng: MAUMELLE.lng, label: MAUMELLE.label, key: "maumelle-ar" };
+  let cities = [];
+  let cityFilterText = "";
+  let osmById = {};   // id -> place object, every live result fetched this session
+  let osmState = {};  // location key -> {status: "loading"|"done"|"error", ids: []}
+
   const store = {
     get saved() { try { return JSON.parse(localStorage.getItem("glutened_saved") || "{}"); } catch { return {}; } },
     set saved(v) { localStorage.setItem("glutened_saved", JSON.stringify(v)); },
@@ -48,7 +54,7 @@
 
   function distOf(p) {
     if (p.lat == null || p.lng == null) return null;
-    return haversine(MAUMELLE.lat, MAUMELLE.lng, p.lat, p.lng);
+    return haversine(currentLoc.lat, currentLoc.lng, p.lat, p.lng);
   }
 
   // fact state: true/false -> yes/no; null or "unverified" -> unknown
@@ -101,27 +107,168 @@
 
   /* ---------------- renderers ---------------- */
 
-  function renderLocal() {
-    const sorted = DB.places
-      .filter(matchesFilters)
-      .map((p) => ({ p, d: distOf(p) }))
-      .sort((a, b) => (a.d == null ? 1 : b.d == null ? -1 : a.d - b.d));
-    let html = `<h2 class="section-title">Near ${esc(MAUMELLE.label)}</h2>
-      <p class="section-sub">${sorted.length} places in the local database, closest first. Unknown facts show as “Not confirmed” — never guessed.</p>
-      <div class="cards">`;
-    for (const { p, d } of sorted) {
-      html += `
+  function placeCard(p, d) {
+    return `
       <article class="card" data-kind="place" data-id="${esc(p.id)}" tabindex="0">
         <h3>${esc(p.name)}</h3>
-        <div class="meta">${esc(p.address)} &middot; ${esc(p.cuisine || "")}${p.price ? " &middot; " + esc(p.price) : ""}${p.rating ? " &middot; ★ " + esc(p.rating) : ""}</div>
+        <div class="meta">${esc(p.address)} &middot; ${esc(p.cuisine || "")}${p.price ? " &middot; " + esc(p.price) : ""}${p.rating ? " &middot; ★ " + esc(p.rating) : ""}${p.osm ? " &middot; via OpenStreetMap" : ""}</div>
         <div class="badges">${badgesForPlace(p)}</div>
-        ${d != null ? `<div class="dist">~${d.toFixed(1)} mi from Maumelle</div>` : ""}
+        ${d != null ? `<div class="dist">~${d.toFixed(1)} mi from ${esc(currentLoc.label)}</div>` : ""}
         ${p.gfItems && p.gfItems.length ? `<div class="items"><strong>GF items</strong>${esc(p.gfItems.join(", "))}</div>` : ""}
       </article>`;
+  }
+
+  function byDist(list) {
+    return list.map((p) => ({ p, d: distOf(p) }))
+      .sort((a, b) => (a.d == null ? 1 : b.d == null ? -1 : a.d - b.d));
+  }
+
+  function renderLocal() {
+    // The built-in database covers the Maumelle / Little Rock area.
+    const homeDist = haversine(currentLoc.lat, currentLoc.lng, MAUMELLE.lat, MAUMELLE.lng);
+    const seeds = homeDist <= 50 ? byDist(DB.places.filter(matchesFilters)) : [];
+    const st = osmState[currentLoc.key];
+    const osmList = st && st.status === "done"
+      ? byDist(st.ids.map((id) => osmById[id]).filter(Boolean).filter(matchesFilters))
+      : [];
+
+    let html = `<h2 class="section-title">Near ${esc(currentLoc.label)}</h2>`;
+    if (seeds.length) {
+      html += `<h3 class="subhead">From the glutened. database</h3>
+        <p class="section-sub">${seeds.length} verified local listings, closest first. Unknown facts show as “Not confirmed” — never guessed.</p>
+        <div class="cards">${seeds.map(({ p, d }) => placeCard(p, d)).join("")}</div>`;
+    }
+    html += `<h3 class="subhead">Live listings — OpenStreetMap</h3>`;
+    if (!st || st.status === "loading") {
+      html += `<p class="section-sub">Searching live map data for gluten-free spots near ${esc(currentLoc.label)}…</p>`;
+    } else if (st.status === "error") {
+      html += `<p class="section-sub">The live map service didn't answer just now — it happens with the free data feed. The Chain Guide works in every city; try the live search again in a bit.</p>`;
+    } else if (!osmList.length) {
+      html += `<p class="section-sub">No places tagged gluten-free on the live map near ${esc(currentLoc.label)} yet. The Chain Guide applies here too, and listings grow as diners file reports.</p>`;
+    } else {
+      html += `<p class="section-sub">${osmList.length} places tagged gluten-free on OpenStreetMap near ${esc(currentLoc.label)} — community map data, so facts beyond the tag show as “Not confirmed” until verified.</p>
+        <div class="cards">${osmList.map(({ p, d }) => placeCard(p, d)).join("")}</div>`;
+    }
+    html += `<div class="chainstrip">Eating at a chain in ${esc(currentLoc.label)}? The <button id="chainStripBtn" type="button">Chain Guide</button> covers 32 chains nationwide, straight from official allergen guides.</div>`;
+    content.innerHTML = html;
+    bindCards();
+    const csb = $("#chainStripBtn");
+    if (csb) csb.addEventListener("click", () => { tab = "chains"; detailTarget = null; render(); window.scrollTo(0, 0); });
+    if (!st) loadOsm(currentLoc);
+  }
+
+  /* -------- live listings from OpenStreetMap (Overpass) -------- */
+
+  const OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.nchc.org.tw/api/interpreter"
+  ];
+
+  function osmToPlace(el) {
+    const t = el.tags || {};
+    if (!t.name) return null;
+    const lat = el.lat != null ? el.lat : el.center && el.center.lat;
+    const lng = el.lon != null ? el.lon : el.center && el.center.lon;
+    if (lat == null || lng == null) return null;
+    const street = [t["addr:housenumber"], t["addr:street"]].filter(Boolean).join(" ");
+    const address = [street, t["addr:city"], t["addr:state"]].filter(Boolean).join(", ") || "Address not listed in the map data";
+    const only = t["diet:gluten_free"] === "only";
+    return {
+      id: "osm-" + el.type + "-" + el.id,
+      name: t.name,
+      address,
+      cuisine: t.cuisine ? t.cuisine.replace(/;/g, ", ") : (t.amenity || ""),
+      phone: t.phone || t["contact:phone"] || null,
+      hours: t.opening_hours || null,
+      rating: null,
+      price: null,
+      lat, lng,
+      osm: true,
+      note: only
+        ? "Tagged on OpenStreetMap as serving ONLY gluten-free food (community-contributed map data). Unverified by glutened. — confirm with the restaurant."
+        : "Listed on OpenStreetMap as offering gluten-free options (community-contributed map data). Everything beyond that tag is unverified — confirm with the restaurant.",
+      gfItems: [],
+      facts: { gfMenu: true, dedicatedFacility: only ? true : null }
+    };
+  }
+
+  async function loadOsm(loc) {
+    const key = loc.key;
+    if (osmState[key]) return;
+    osmState[key] = { status: "loading", ids: [] };
+    const q = `[out:json][timeout:20];(` +
+      `node["diet:gluten_free"~"yes|only"](around:20000,${loc.lat},${loc.lng});` +
+      `way["diet:gluten_free"~"yes|only"](around:20000,${loc.lat},${loc.lng});` +
+      `node["amenity"~"restaurant|cafe|fast_food|bakery|bar|pub"]["name"~"gluten",i](around:20000,${loc.lat},${loc.lng});` +
+      `way["amenity"~"restaurant|cafe|fast_food|bakery|bar|pub"]["name"~"gluten",i](around:20000,${loc.lat},${loc.lng});` +
+      `);out center 80;`;
+    let data = null;
+    for (const url of OVERPASS_MIRRORS) {
+      try {
+        const ctl = new AbortController();
+        const timer = setTimeout(() => ctl.abort(), 22000);
+        const r = await fetch(url, { method: "POST", body: "data=" + encodeURIComponent(q), signal: ctl.signal });
+        clearTimeout(timer);
+        if (!r.ok) continue;
+        data = await r.json();
+        break;
+      } catch (e) { /* try the next mirror */ }
+    }
+    if (!data) {
+      osmState[key] = { status: "error", ids: [] };
+    } else {
+      const ids = [];
+      for (const el of data.elements || []) {
+        const p = osmToPlace(el);
+        if (p) { osmById[p.id] = p; ids.push(p.id); }
+      }
+      osmState[key] = { status: "done", ids };
+    }
+    if (tab === "local" && currentLoc.key === key && !detailTarget) render();
+  }
+
+  /* -------- city browser -------- */
+
+  function selectCity(c) {
+    currentLoc = { lat: c.lat, lng: c.lng, label: c.name + ", " + c.state, key: (c.name + "-" + c.state).toLowerCase() };
+    $("#locationLabel").textContent = currentLoc.label;
+    tab = "local";
+    detailTarget = null;
+    searchQuery = "";
+    render();
+    window.scrollTo(0, 0);
+  }
+
+  function renderCities() {
+    const q = cityFilterText.trim().toLowerCase();
+    const list = cities.filter((c) => !q || (c.name + " " + c.state).toLowerCase().includes(q) || (c.name + ", " + c.state).toLowerCase().includes(q));
+    let html = `<h2 class="section-title">Browse cities</h2>
+      <p class="section-sub">${cities.length} major US cities, all 50 states. Tap a city to search it — verified listings where we have them, live gluten-free map results, and the Chain Guide everywhere.</p>
+      <input id="cityFilter" class="city-filter" type="search" placeholder="Filter cities — try “Dallas” or “TX”" value="${esc(cityFilterText)}" aria-label="Filter cities">
+      <div class="city-list">`;
+    for (const c of list) {
+      const home = haversine(c.lat, c.lng, MAUMELLE.lat, MAUMELLE.lng) <= 50;
+      html += `<button class="city-row" type="button" data-city="${esc(c.name)}|${esc(c.state)}"><span>${esc(c.name)}, ${esc(c.state)}</span>${home ? '<span class="badge yes">Local listings</span>' : ""}</button>`;
     }
     html += `</div>`;
-    content.innerHTML = html || `<div class="empty">No places match those filters.</div>`;
-    bindCards();
+    if (!list.length) html += `<div class="empty">No cities match that filter — but you can still type any city in the search box up top.</div>`;
+    content.innerHTML = html;
+    const inp = $("#cityFilter");
+    inp.addEventListener("input", () => {
+      const pos = inp.selectionStart;
+      cityFilterText = inp.value;
+      renderCities();
+      const again = $("#cityFilter");
+      if (again) { again.focus(); try { again.setSelectionRange(pos, pos); } catch (e) {} }
+    });
+    content.querySelectorAll(".city-row").forEach((b) => {
+      b.addEventListener("click", () => {
+        const parts = b.dataset.city.split("|");
+        const c = cities.find((x) => x.name === parts[0] && x.state === parts[1]);
+        if (c) selectCity(c);
+      });
+    });
   }
 
   function renderChains() {
@@ -201,7 +348,7 @@
         <li><strong>Safety reports:</strong> structured reports from diners, saved on this device. Reports from reviewers who have celiac disease are badged first.</li>
       </ul>
       <h3>How this prototype searches</h3>
-      <p>v0.1 searches the built-in database and applies the Chain Guide to any US city you type. Live nationwide place listings arrive in a later version via a Google Places key — that's the piece that turns this prototype into a launch.</p>
+      <p>Open the <strong>Cities</strong> tab to browse 120+ major US cities across all 50 states, or type a city up top. Picking a city shows verified listings where we have them, live gluten-free listings from OpenStreetMap, and the Chain Guide applies in every city. A Google Places key in a later version adds full live listings nationwide — that's the piece that turns this prototype into a launch.</p>
       <h3>The promise</h3>
       <ul>
         <li>No ads. Ever.</li>
@@ -232,7 +379,7 @@
 
   /* ---------------- detail ---------------- */
 
-  function findPlace(id) { return DB.places.find((p) => p.id === id); }
+  function findPlace(id) { return DB.places.find((p) => p.id === id) || osmById[id]; }
   function findChain(name) { return DB.chains.find((c) => c.name === name); }
 
   function renderDetail(kind, id) {
@@ -341,6 +488,7 @@
     filtersBar.hidden = !(tab === "local" || tab === "chains");
     if (searchQuery) return renderNationwide(searchQuery);
     if (tab === "local") renderLocal();
+    else if (tab === "cities") renderCities();
     else if (tab === "chains") renderChains();
     else if (tab === "drinks") renderDrinks();
     else if (tab === "saved") renderSaved();
@@ -365,20 +513,25 @@
     render();
   });
 
+  function setHome() {
+    currentLoc = { lat: MAUMELLE.lat, lng: MAUMELLE.lng, label: MAUMELLE.label, key: "maumelle-ar" };
+    $("#locationLabel").textContent = MAUMELLE.label;
+    tab = "local";
+  }
+
   function doSearch() {
     const q = $("#citySearch").value.trim();
     searchQuery = "";
     detailTarget = null;
-    if (!q) {
-      tab = "local";
-      $("#locationLabel").textContent = MAUMELLE.label;
-      render();
-      return;
-    }
+    if (!q) { setHome(); render(); return; }
+    // Match against the built-in major-cities list first.
+    const ql = q.toLowerCase().replace(/,/g, " ").replace(/\s+/g, " ").trim();
+    const hit = cities.find((c) => (c.name + " " + c.state).toLowerCase() === ql || c.name.toLowerCase() === ql)
+      || (ql.length >= 3 ? cities.find((c) => (c.name + " " + c.state).toLowerCase().startsWith(ql)) : null);
+    if (hit) { selectCity(hit); $("#citySearch").value = ""; return; }
     const local = /maumelle|little\s*rock|north little rock|sherwood|cabot|benton|conway/i.test(q);
     if (local) {
-      tab = "local";
-      $("#locationLabel").textContent = MAUMELLE.label;
+      setHome();
     } else {
       $("#locationLabel").textContent = q;
       searchQuery = q;
@@ -393,9 +546,11 @@
   Promise.all([
     fetch("data/places.json").then((r) => r.json()),
     fetch("data/chains.json").then((r) => r.json()),
-    fetch("data/drinks.json").then((r) => r.json())
-  ]).then(([places, chains, drinks]) => {
+    fetch("data/drinks.json").then((r) => r.json()),
+    fetch("data/cities.json").then((r) => r.json()).catch(() => [])
+  ]).then(([places, chains, drinks, cityList]) => {
     DB = { places, chains, drinks };
+    cities = cityList || [];
     render();
   }).catch(() => {
     content.innerHTML = `<div class="empty">Couldn't load the data files.<br>Open this page over HTTP (or inside the app) — file:// blocks data loading.</div>`;

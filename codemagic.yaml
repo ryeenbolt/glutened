@@ -1,35 +1,23 @@
 # codemagic.yaml — cloud build for glutened. (Ryan: no Mac, so iOS builds happen here.)
 #
-# HOW THIS CONNECTS TO YOU (do these in order — details in README.md):
-#   1. Push this folder to a GitHub repo, add that repo to Codemagic.
-#   2. In Codemagic: Teams > Integrations > connect "Apple Developer Portal"
-#      (or add your App Store Connect API key under Teams > Integrations >
-#      App Store Connect). That fills in the APP_STORE_CONNECT_* credentials below.
-#   3. Codemagic reads the bundle id below (com.glutened.app) — the same ID must
-#      exist in your Apple Developer account when you enroll ($99/yr).
-#
-# Nothing here is signed or published until you complete those steps.
+# STATUS (Oct 18, 2026): code signing and App Store publishing are NOT configured
+# in this file yet. They require Ryan's Apple Developer account and the
+# App Store Connect integration inside Codemagic (Teams > Integrations).
+# Codemagic's validator rejects the ios_signing / publishing blocks until that
+# integration exists, so those sections were removed on purpose — they get
+# added back (with the fetch-signing-files step) once Apple is connected.
+# Everything else — install, Capacitor sync, .ipa build — is ready.
 
 workflows:
   ios-workflow:
-    name: glutened — iOS build
+    name: glutened iOS build
     max_build_duration: 60
     instance_type: mac_mini_m2
     environment:
-      ios_signing:
-        distribution_type: app_store
-        bundle_ids:
-          - com.glutened.app
       vars:
-        APP_ID: com.glutened.app          # ← must match capacitor.config.json appId
+        APP_ID: com.glutened.app          # must match capacitor.config.json appId
         XCODE_WORKSPACE: "ios/App/App.xcworkspace"
         XCODE_SCHEME: "App"
-        # --- Ryan's Apple credentials go here via Codemagic (Teams > Integrations),
-        # --- NOT hardcoded in this file. Placeholders only:
-        # APP_STORE_CONNECT_ISSUER_ID: Encrypted(...)
-        # APP_STORE_CONNECT_KEY_IDENTIFIER: Encrypted(...)
-        # APP_STORE_CONNECT_PRIVATE_KEY: Encrypted(...)
-        # CERTIFICATE_PRIVATE_KEY: Encrypted(...)
       xcode: latest
       cocoapods: default
       node: latest
@@ -52,16 +40,7 @@ workflows:
             npx cap add ios
           fi
           npx cap sync ios
-      - name: Set up keychain for code signing
-        script: keychain initialize
-      - name: Fetch code signing files from App Store Connect
-        script: |
-          # Requires the Apple Developer Portal integration in Codemagic
-          # (see the comments at the top of this file).
-          app-store-connect fetch-signing-files "$APP_ID" \
-            --type IOS_APP_STORE \
-            --create
-      - name: Build the .ipa for the App Store
+      - name: Build the .ipa
         script: |
           xcode-project build-ipa \
             --workspace "$XCODE_WORKSPACE" \
@@ -69,8 +48,3 @@ workflows:
     artifacts:
       - build/ios/ipa/*.ipa
       - /tmp/xcodebuild_logs/*.log
-    publishing:
-      app_store_connect:
-        # Uses the Apple Developer Portal integration you connected in Codemagic.
-        auth: integration
-        submit_to_testflight: false   # flip to true when you want beta testers
